@@ -28,6 +28,7 @@ type MainAgent struct {
 	maxTurns        int                                    // max agent turns per run (0 = unlimited)
 	proxyAddr       string                                 // recording proxy for WebFetch (empty = direct)
 	proxyCACert     string                                 // recording proxy's CA cert path (HTTPS verify)
+	factTraffic     FactTrafficLookup                      // proxy captures for fact provenance (nil = activity-only)
 	webSearch       WebSearchOpts                          // web_search tool backend selection (off by default)
 	workDir         string                                 // shared work dir (surfaced in prompt as artifact-output target)
 	steerWork       func(intentID int64, msg string) error // engine callback: steer a running work (nil = off)
@@ -75,6 +76,10 @@ func (m *MainAgent) compactionWindow() int {
 // cert it trusts to verify HTTPS through it (empty addr = direct).
 func (m *MainAgent) SetProxy(addr, caCert string) { m.proxyAddr, m.proxyCACert = addr, caCert }
 
+// SetFactTraffic wires the proxy capture store used to classify recorded facts
+// (#124 row 1). nil keeps the activity-only classification.
+func (m *MainAgent) SetFactTraffic(l FactTrafficLookup) { m.factTraffic = l }
+
 // SetWebSearch selects the web_search backend for the main agent (off by default).
 func (m *MainAgent) SetWebSearch(o WebSearchOpts) { m.webSearch = o }
 
@@ -114,11 +119,12 @@ func mainAgentSystem(goal, dataDir, workDir string) string {
 func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.AssetStore, ts *db.ExplorationStore, goal, message string, hooks harness.HookRunner, emit func(db.Activity), notify, resume func(), notifyGoal func([]string), notifyHint func(string, []string)) (string, error) {
 	tsx := NewToolSet(ts, "human")
 	tsx.SetFindingRecorder(m.findingRecorder)
+	tsx.SetFactTraffic(m.factTraffic)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
 	tsx.SetTaskID(taskID)
-	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
+	tsx.SetCoverageEnabled(coverageOn(as, taskID))
 	tsx.SetNotify(notify)         // generic wake-up (write ops without a dedicated callback go through it, debounced)
 	tsx.SetResumeTask(resume)     // set_goals adds a goal → pull a completed/paused task back to running
 	tsx.SetNotifyGoal(notifyGoal) // set_goals adds a goal → record a "human added a goal: …" trigger for the planner
@@ -126,11 +132,11 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	tsx.steerWork = m.steerWork   // enable steer_work tool (nil = unavailable)
 	// domain tools + basic default toolset (Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash)
 	// when the asset coverage feature is off, drop add_task_scope/list_untested_assets (not in the prompt).
-	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), actool.DefaultTools()...)
+	base := append(tsx.DropCoverageTools(tsx.MainAgentTools()), defaultTools(m.workDir)...)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "mainagent", base)
 	defer cleanup()
-	// this task's working directory <workDir>/tasks/<taskID>, created up front.
+	// the main run directory <workDir>/tasks/<taskID>/main, created up front.
 	mainDir := ensureRunDir(m.workDir, taskID, 0)
 	ctx = intercept.WithReviewWorkingDirectory(ctx, mainDir)
 	system, boundary := deferredSystem(mainAgentSystem(goal, m.workDir, mainDir), def)
@@ -148,13 +154,15 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 		WebSearchBackend:      m.webSearch.Backend,
 		BraveSearchAPIKey:     m.webSearch.BraveKey,
 		TavilySearchAPIKey:    m.webSearch.TavilyKey,
+		KeenableSearchAPIKey:  m.webSearch.KeenableKey,
+		KeenableSearchTitle:   KeenableSearchTitle,
 		DeepSeekSearchBaseURL: m.webSearch.DeepSeekBaseURL,
 		DeepSeekSearchAPIKey:  m.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   m.webSearch.DeepSeekModel,
 		WebSearchProxy:        m.webSearch.Proxy,
 		BashEnv:               proxyEnv(m.proxyAddr, m.proxyCACert), // Bash subcommands go through the proxy + trust the CA by default
-		WorkingDir:            mainDir,                              // this task's working directory <workDir>/tasks/<taskID>
-		ToolOutputDir:         cmdOutDir(mainDir),
+		WorkingDir:            mainDir,                              // the main run directory <workDir>/tasks/<taskID>/main
+		ToolOutputDir:         TaskToolOutputDir(m.workDir, taskID, mainDir),
 		MaxTurns:              m.maxTurns,                             // 0 = unlimited (configurable in agent management)
 		Compaction:            compactionConfig(m.compactionWindow()), // long chats stay within the window
 		Todos:                 actool.NewTodoStore(),                  // session-level temporary todos (TodoWrite), planning only, dropped on exit
@@ -169,14 +177,18 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}
+	opts.Hooks = SpillHooks(opts.Hooks, opts.ToolOutputDir)
+	// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
+	// load; each new session (seg>=1) gets its own file for a clean context. The id
+	// is the provider-side identity (session header, usage metering) with or without
+	// persistence; Norma only puts it on ctx when it writes a transcript.
+	opts.SessionID = fmt.Sprintf("exp%d-main", ts.ID())
+	if mainSeg > 0 {
+		opts.SessionID = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
+	}
+	ctx = transcript.WithSessionID(ctx, opts.SessionID)
 	if m.tx != nil { // persist raw human↔AI conversation; one accumulating file per segment
 		opts.Transcript = m.tx
-		// Segment 0 keeps the legacy "exp%d-main" name so existing transcripts still
-		// load; each new session (seg>=1) gets its own file for a clean context.
-		opts.SessionID = fmt.Sprintf("exp%d-main", ts.ID())
-		if mainSeg > 0 {
-			opts.SessionID = fmt.Sprintf("exp%d-main-s%d", ts.ID(), mainSeg)
-		}
 	}
 	// experimental feature: when enabled, noa takes over context compression (archive centralized under <workDir>/noa/<SessionID>, persistent).
 	// the session id follows the same rule as the transcript (segment-aware), keeping archive and resume aligned.
@@ -191,8 +203,11 @@ func (m *MainAgent) Chat(ctx context.Context, taskID int64, mainSeg int, as *db.
 	// reload the prior conversation from the transcript so the agent has context
 	// across turns (each Chat is a fresh session; without this it can't see earlier
 	// messages). First turn: no file yet → Resume loads nothing and proceeds.
+	// A corrupt or unreadable transcript stops the turn before any model or tool call.
 	if m.tx != nil {
-		_ = s.Resume(opts.SessionID)
+		if err := resumeSession(s, opts.SessionID); err != nil {
+			return "", err
+		}
 	}
 	// C2: this session is fresh each turn; re-unlock skill-gated MCPs from prior
 	// Skill() calls in the reloaded history so revealed tools stay callable.

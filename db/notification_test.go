@@ -18,7 +18,7 @@ func notifyTestDB(t *testing.T) *DB {
 	t.Helper()
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 	return d
@@ -534,7 +534,7 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
+	t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
 	es := d.Exploration(tk.ExplorationID)
 	f, err := es.RecordFinding(ctx, RecordFindingInput{
 		TaskID: tk.ID, Worker: "test", VulnClass: "SQL injection", Name: "status change case",
@@ -543,7 +543,10 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID)
+		_, _ = d.DeleteFinding(f.FindingID)
+	})
 
 	// Writing the finding already registered one finding_created event; count it as the baseline.
 	var base int
@@ -604,6 +607,72 @@ func TestSetFindingStatusWithNotifyOnlyEmitsOnRealChange(t *testing.T) {
 	// Nonexistent finding: found=false, no error.
 	if _, found, _, err := d.SetFindingStatusWithNotify(ctx, 999999999, "fixed"); err != nil || found {
 		t.Fatalf("a nonexistent finding should return found=false with no error, got found=%v err=%v", found, err)
+	}
+}
+
+// A bulk update is one transaction with a per-id result: unknown ids are
+// reported, not fatal, and a second call is a no-op that emits no event.
+func TestSetFindingStatusesWithNotify(t *testing.T) {
+	d := notifyTestDB(t)
+	ctx := context.Background()
+
+	tk, err := d.CreateTask("bulk status test", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
+	es := d.Exploration(tk.ExplorationID)
+	record := func(name string) int64 {
+		fi, err := es.RecordFinding(ctx, RecordFindingInput{
+			TaskID: tk.ID, Worker: "test", VulnClass: "XSS", Name: name,
+			Severity: "medium", Summary: "summary",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, fi.FindingID)
+			_, _ = d.DeleteFinding(fi.FindingID)
+		})
+		return fi.FindingID
+	}
+	first, second := record("bulk one"), record("bulk two")
+	const missingID = int64(999999999)
+
+	results, err := d.SetFindingStatusesWithNotify(ctx, []int64{first, second, missingID}, FindingConfirmed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("want 3 results, got %d", len(results))
+	}
+	for i, want := range []int64{first, second} {
+		r := results[i]
+		if r.ID != want || !r.Found || !r.Changed || !r.Notified || r.From != FindingPending {
+			t.Fatalf("result %d: %+v", i, r)
+		}
+	}
+	if r := results[2]; r.Found || r.Changed || r.Notified {
+		t.Fatalf("a missing id should be found=false with no change: %+v", r)
+	}
+	for _, id := range []int64{first, second} {
+		var status string
+		if err := d.QueryRow(`SELECT status FROM findings WHERE id=$1`, id).Scan(&status); err != nil || status != FindingConfirmed {
+			t.Fatalf("finding %d status = %q (%v)", id, status, err)
+		}
+		var events int
+		if err := d.QueryRow(`SELECT count(*) FROM notification_events WHERE finding_id=$1 AND kind=$2`, id, notify.EventFindingStatusChanged).Scan(&events); err != nil || events != 1 {
+			t.Fatalf("finding %d status events = %d (%v)", id, events, err)
+		}
+	}
+
+	// Same status again: no change, so no push.
+	again, err := d.SetFindingStatusesWithNotify(ctx, []int64{first}, FindingConfirmed)
+	if err != nil || len(again) != 1 {
+		t.Fatalf("second batch: %v %v", again, err)
+	}
+	if again[0].Changed || again[0].Notified {
+		t.Fatalf("a no-op batch should neither change nor notify: %+v", again[0])
 	}
 }
 
@@ -828,7 +897,7 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.DeleteTask(tk.ID)
+	t.Cleanup(func() { _ = d.DeleteTask(tk.ID) })
 	es := d.Exploration(tk.ExplorationID)
 	f, err := es.RecordFinding(ctx, RecordFindingInput{
 		TaskID: tk.ID, Worker: "test", VulnClass: "SQL injection", Name: "retest target",
@@ -837,7 +906,10 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID) })
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM notification_events WHERE finding_id=$1`, f.FindingID)
+		_, _ = d.DeleteFinding(f.FindingID)
+	})
 
 	// Create a retest record and drive it straight to completion.
 	rt, _, _, err := d.CreateFindingRetest(ctx, f.FindingID, "review")
@@ -847,6 +919,8 @@ func TestFinishFindingRetestEmitsStatusChange(t *testing.T) {
 	if rt.ConversationID == nil {
 		t.Fatal("a retest should be associated with a session")
 	}
+	retestConvID := *rt.ConversationID
+	t.Cleanup(func() { _ = d.DeleteConversation(retestConvID) })
 	// A retest must enter running before a verdict can land (consistent with the real flow).
 	if ok, err := d.StartFindingRetest(ctx, rt.ID); err != nil || !ok {
 		t.Fatalf("failed to start retest: ok=%v err=%v", ok, err)

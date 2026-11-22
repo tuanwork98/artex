@@ -26,7 +26,7 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 	m, err := NewManager(dir, "")
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		t.Skipf("postgres unavailable (%v) - skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() {
 		_ = m.Close()
@@ -67,7 +67,9 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+	defer stopTestServer(t, s, cancel)
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
 		t.Fatal(err)

@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 // jwtKeyDirs returns fresh key, data and legacy base dirs and points
@@ -194,7 +196,7 @@ func TestLoadOrCreateJWTKeyNeverOverwrites(t *testing.T) {
 func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	// Close the pool so subsequent GetSetting returns an error instead of sql.ErrNoRows.
@@ -220,7 +222,7 @@ func TestAuthStatusFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 func TestAuthInitFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	if err := m.pg.Close(); err != nil {
@@ -245,11 +247,11 @@ func TestAuthInitFailsClosedWhenDataSourceUnavailable(t *testing.T) {
 func TestAuthInitRequiresSetupToken(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v)", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	clearPassword := func() {
-		if _, err := m.pg.Exec(`DELETE FROM settings WHERE key=$1`, authPassKey); err != nil {
+		if _, err := m.pg.Exec(`DELETE FROM settings WHERE key=$1 OR key=$2`, authPassKey, authPwdVersionKey); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -4,10 +4,9 @@ import * as React from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-import { ChevronRight, MailIcon, PlusCircleIcon } from "lucide-react";
+import { ChevronRight } from "lucide-react";
 import { api } from "@/lib/api";
 
-import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   DropdownMenu,
@@ -29,6 +28,7 @@ import {
   SidebarMenuSubItem,
   useSidebar,
 } from "@/components/ui/sidebar";
+import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
 import type {
   NavBadge,
@@ -37,6 +37,7 @@ import type {
   NavMainLinkItem,
   NavMainParentItem,
 } from "@/navigation/sidebar/sidebar-items";
+import { setVisibleInterval } from "@/lib/polling";
 
 interface NavMainProps {
   readonly items: readonly NavGroup[];
@@ -174,8 +175,8 @@ function InterceptPendingBadge() {
       } catch { /* ignore */ }
     }
     poll();
-    const t = setInterval(poll, 5000);
-    return () => { live = false; clearInterval(t); };
+    const stopPolling = setVisibleInterval(poll, 5000);
+    return () => { live = false; stopPolling(); };
   }, []);
   if (count === 0) return null;
   return (
@@ -320,7 +321,7 @@ function NavItemBadge({ badge }: { badge?: NavBadge }) {
         badge === "soon" && "border-muted-foreground text-muted-foreground",
       )}
     >
-      {badge}
+      {t(badge)}
     </SidebarMenuBadge>
   );
 }

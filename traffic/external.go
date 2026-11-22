@@ -38,6 +38,15 @@ func (t *Traffic) RecordExternal(e ExternalExchange) error {
 	if method == "" {
 		return fmt.Errorf("empty method for %q", e.URL)
 	}
+	if !validHeaderName(method) {
+		return fmt.Errorf("invalid method %q", e.Method)
+	}
+	if err := validateExternalHeaders(e.RequestHeaders); err != nil {
+		return err
+	}
+	if err := validateExternalHeaders(e.ResponseHeaders); err != nil {
+		return err
+	}
 	status := e.Status
 	if status == 0 {
 		status = 200
@@ -76,6 +85,11 @@ func (t *Traffic) insertExchange(id string, ts int64, host, method, urlTemplate,
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
+	// An id can repeat (seconds plus a rolling counter); the trace of the
+	// exchange it replaces must not stay attached to this one.
+	if _, err := tx.Exec(`DELETE FROM exchange_rewrites WHERE exchange_id=?`, id); err != nil {
+		return fmt.Errorf("clearing rewrite trace: %w", err)
+	}
 	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
 VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
 		id, ts, host, method, urlTemplate, rawURL, status, contentType, reqLen, respLen)
@@ -111,6 +125,18 @@ VALUES(?,?,?,?,?,?,?)`,
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("committing: %w", err)
+	}
+	return nil
+}
+
+func validateExternalHeaders(h map[string]string) error {
+	for k, v := range h {
+		if !validHeaderName(k) {
+			return fmt.Errorf("invalid header name %q", k)
+		}
+		if strings.ContainsAny(v, "\r\n\x00") {
+			return fmt.Errorf("header %s contains a line break", k)
+		}
 	}
 	return nil
 }

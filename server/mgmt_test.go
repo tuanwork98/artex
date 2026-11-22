@@ -7,19 +7,27 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/Autumn-27/artex/db"
 )
 
 // TestMgmtAPI exercises the PostgreSQL-backed management API through the real mux.
 func TestMgmtAPI(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("database unavailable (%v) — skipping management API test", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	if m.pg == nil {
-		t.Skip("postgres unavailable — skipping management API test")
+		db.SkipNoPG(t)
 	}
+	// New starts the notifier and task-archive workers on context.Background();
+	// closing the pool stops them from claiming later tests' digest batches
+	// and archive jobs.
+	defer m.Close()
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, td, td, td)
+	defer stopTestServer(t, s, cancel)
 	h := s.Handler()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {

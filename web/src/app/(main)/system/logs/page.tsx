@@ -7,15 +7,16 @@ import { sseUrl } from "@/lib/api";
 import { MOCK } from "@/lib/mock/enabled";
 import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { t } from "@/i18n";
 
 // Mock demo: no backend SSE, so stuff in a few sample log lines.
 const MOCK_LOGS: LogLine[] = [
-  { seq: 1, ts: "2026-07-26T03:55:00Z", level: "info", tag: "engine", text: "ARTEX v0.1.0 backend listening on :8787 (workers=3)" },
-  { seq: 2, ts: "2026-07-26T03:55:01Z", level: "info", tag: "config", text: "LLM configured from DB: anthropic / claude-opus-4-8" },
-  { seq: 3, ts: "2026-07-26T03:56:10Z", level: "info", tag: "planner", text: "task t-acme-web: planning round 3, generated intent i-4" },
-  { seq: 4, ts: "2026-07-26T03:57:00Z", level: "warn", tag: "guard", text: "block bash: target out of bounds, out.evil.example is not in scope" },
-  { seq: 5, ts: "2026-07-26T03:57:30Z", level: "info", tag: "work#1", text: "report_finding: Default Credentials (high) saved to database" },
-  { seq: 6, ts: "2026-07-26T03:58:20Z", level: "error", tag: "work#3", text: "intercept: mysqldump matched a destructive rule, awaiting manual approval" },
+  { seq: 1, ts: "2026-11-14T03:55:00Z", level: "info", tag: "engine", text: "ARTEX v0.6.0 backend listening on :8787 (workers=3)" },
+  { seq: 2, ts: "2026-11-14T03:55:01Z", level: "info", tag: "config", text: "LLM configured from DB: anthropic / claude-opus-4-8" },
+  { seq: 3, ts: "2026-11-14T03:56:10Z", level: "info", tag: "planner", text: "task t-acme-web: planning round 3, generated intent i-4" },
+  { seq: 4, ts: "2026-11-14T03:57:00Z", level: "warn", tag: "guard", text: "block bash: target out of bounds, out.evil.example is not in scope" },
+  { seq: 5, ts: "2026-11-14T03:57:30Z", level: "info", tag: "work#1", text: "report_finding: Default Credentials (high) saved to database" },
+  { seq: 6, ts: "2026-11-14T03:58:20Z", level: "error", tag: "work#3", text: "intercept: mysqldump matched a destructive rule, awaiting manual approval" },
 ];
 
 const levelTone: Record<LogLine["level"], string> = {
@@ -142,13 +143,13 @@ export default function LogsPage() {
   return (
     <div className="flex flex-1 flex-col gap-3">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight">System logs</h1>
-        <p className="text-muted-foreground text-sm">Live backend log stream (planner / worker / database / traffic …)</p>
+        <h1 className="text-xl font-semibold tracking-tight">{t("System logs")}</h1>
+        <p className="text-muted-foreground text-sm">{t("Live backend log stream (planner / worker / database / traffic …)")}</p>
       </div>
       <div className="flex flex-1 flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <Input
-            placeholder="Filter (text / tag)…"
+            placeholder={t("Filter (text / tag)…")}
             value={q}
             onChange={(e) => setQ(e.target.value)}
             className="h-8 max-w-xs"
@@ -162,7 +163,7 @@ export default function LogsPage() {
                 className="h-8"
                 onClick={() => setLevel(lv)}
               >
-                {lv === "all" ? "All" : lv}
+                {lv === "all" ? t("All") : t(lv)}
               </Button>
             ))}
           </div>
@@ -172,15 +173,15 @@ export default function LogsPage() {
             className="h-8"
             onClick={() => setPaused((p) => !p)}
           >
-            {paused ? "Paused" : "Pause"}
+            {paused ? t("Paused") : t("Pause")}
           </Button>
           <Button size="sm" variant="outline" className="h-8" onClick={() => setLines([])}>
-            Clear
+            {t("Clear")}
           </Button>
           <span className="ml-auto text-xs text-muted-foreground">
-            {counts.total} lines ·{" "}
-            <span className="text-amber-600 dark:text-amber-400">{counts.warn} warnings</span> ·{" "}
-            <span className="text-red-600 dark:text-red-400">{counts.error} errors</span>
+            {t("{count} lines", { count: counts.total })} ·{" "}
+            <span className="text-amber-600 dark:text-amber-400">{t("{count} warnings", { count: counts.warn })}</span> ·{" "}
+            <span className="text-red-600 dark:text-red-400">{t("{count} errors", { count: counts.error })}</span>
           </span>
         </div>
 
@@ -200,12 +201,12 @@ export default function LogsPage() {
                 disabled={loadingHistory}
                 onClick={loadOlderHistory}
               >
-                {loadingHistory ? "Loading…" : "Load older logs"}
+                {loadingHistory ? t("Loading…") : t("Load older logs")}
               </Button>
             </div>
           )}
           {filtered.length === 0 ? (
-            <p className="py-10 text-center text-muted-foreground">No logs yet.</p>
+            <p className="py-10 text-center text-muted-foreground">{t("No logs yet.")}</p>
           ) : (
             filtered.map((l) => {
               const body =

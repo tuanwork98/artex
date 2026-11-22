@@ -32,6 +32,7 @@ export interface Task {
   tokens?: TokenTotal; // whole-task token consumption
   llm_profile_id?: number; // LLM profile used; absent = default profile
   llm_profile_ids?: number[]; // ordered task-level failover chain
+  llm_rotate?: boolean;
   active_llm_profile_id?: number; // profile used by the next LLM call
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
@@ -100,6 +101,7 @@ export interface TaskArchiveTokenStats {
 }
 
 export interface TaskArchive {
+  storage?: "local" | "s3";
   id: number;
   task_id: number;
   state: TaskArchiveState;
@@ -485,6 +487,9 @@ export type FindingStatus =
 // human triage status above. "blocked" is produced by no path yet but is displayed when present.
 export type VerificationStatus = "verified" | "unverified" | "blocked" | "not_assessed" | "false_positive";
 
+// Report stage after triage: a finding can be confirmed and submitted at the same time.
+export type FindingReportState = "none" | "submitted" | "accepted" | "rejected" | "duplicate";
+
 // FindingAsset is an asset bound to a vulnerability (label pre-rendered by the backend).
 export interface FindingAsset {
   id: string;
@@ -508,6 +513,7 @@ export interface Finding {
   name?: string; // vulnerability name; display falls back to vulnclass when empty
   severity: Severity;
   status: FindingStatus;
+  report_state?: FindingReportState; // workflow stage after triage; default none
   summary: string;
   evidence: string;
   report?: string; // detailed report (Markdown); returned only by the detail endpoint, empty in lists
@@ -561,6 +567,8 @@ export interface FindingDeepenResponse {
 export interface FindingStats {
   total: number;
   pending: number;
+  submitted: number;
+  accepted: number;
   critical: number;
   high: number;
   medium: number;
@@ -584,6 +592,7 @@ export interface FindingQuery {
   pageSize: number;
   severity?: "all" | Severity;
   status?: "all" | FindingStatus;
+  reportState?: "all" | FindingReportState;
   verificationStatus?: "all" | VerificationStatus;
   vulnclass?: string;
   task?: string; // task id; "all"/empty = no task filter
@@ -895,6 +904,36 @@ export interface TrafficExchange {
   status: number;
   content_type: string;
   resp_len: number;
+  rewritten?: boolean;
+}
+
+export interface TrafficRewriteStats {
+  large_responses: number;
+  capacity_refusals: number;
+  tombstone_drops: number;
+  conversions: number;
+  sweeps: number;
+}
+
+export interface TrafficHARImportError {
+  index: number;
+  url?: string;
+  reason: string;
+}
+
+export interface TrafficHARImportResult {
+  imported: number;
+  skipped: number;
+  failed: number;
+  truncated?: boolean;
+  errors?: TrafficHARImportError[];
+}
+
+export interface TrafficHARExportMeta {
+  exported: number;
+  matched: number;
+  truncated: boolean;
+  truncatedReason?: string;
 }
 
 export interface TrafficResp {
@@ -905,12 +944,67 @@ export interface TrafficResp {
   page?: number;
   size?: number;
   exchanges?: TrafficExchange[];
+  rewrite?: TrafficRewriteStats;
 }
 
 // Full raw request/response of one exchange (lazy-loaded on row select).
 export interface TrafficDetail {
   req: string;
   resp: string;
+  // WebSocket/SSE exchanges carry their messages separately (trafficStream);
+  // stream_kind is "" for an ordinary exchange.
+  stream_count?: number;
+  stream_kind?: "websocket" | "sse" | "";
+}
+
+// One recorded WebSocket message or SSE event. ts is in Unix seconds; seq
+// orders. payload is a preview of at most 4 KiB (base64 when encoding is
+// "base64"); blob names the full payload when it was stored separately.
+export interface TrafficStreamMessage {
+  seq: number;
+  ts: number;
+  direction: "c2s" | "s2c" | "meta" | (string & {});
+  kind: number;
+  type: "text" | "binary" | "event" | "meta" | (string & {});
+  event?: string;
+  event_id?: string;
+  retry?: number;
+  size: number;
+  payload: string;
+  encoding?: string;
+  blob?: string;
+  truncated?: boolean;
+}
+
+export interface TrafficStreamPage {
+  items: TrafficStreamMessage[];
+  total: number;
+}
+
+export interface TrafficReplayHeader {
+  name: string;
+  value: string;
+}
+
+// POST /api/traffic/replay. Host is not sent: the server takes it from url.
+// apply_rules defaults to false (bypasses capture rewrite rules).
+export interface TrafficReplayRequest {
+  method: string;
+  url: string;
+  headers: TrafficReplayHeader[];
+  body: string;
+  body_base64: boolean;
+  apply_rules?: boolean;
+}
+
+export interface TrafficReplayResult {
+  status: number;
+  headers: TrafficReplayHeader[];
+  raw: string;
+  duration_ms: number;
+  truncated: boolean;
+  // false when the host is in passthrough: the response was not recorded.
+  recorded: boolean;
 }
 
 // One distinct recorded host with its exchange count (target picker).
@@ -924,15 +1018,17 @@ export interface Settings {
   traffic_capture: boolean;
   agent_traffic_binding: boolean; // agents auto-bind traffic evidence, off by default; does not affect manual binding
   llm_record: boolean; // LLM recording switch (off by default); when off no LLM calls are recorded
-  // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
+  // Web search. brave_key_set / tavily_key_set / keenable_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
   web_search_enabled: boolean;
-  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "deepseek"
+  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "keenable" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
+  keenable_key_set: boolean;
   // write-only: only sent on PUT to store/clear the key.
   brave_search_api_key?: string;
   tavily_search_api_key?: string;
+  keenable_search_api_key?: string;
   // Dedicated egress proxy (http/https/socks5) for reaching search endpoints; unrelated to the MITM proxy that records traffic. Empty = direct.
   web_search_proxy?: string;
   // Global egress proxy (http/https/socks5, may carry user:pass) that all target traffic goes
@@ -962,6 +1058,23 @@ export interface Settings {
   // Render limits of IM messages; 0 = no truncation. The backend answers 400 outside the bounds.
   notify_summary_max_runes?: number; // summary characters per finding, 0-4000, default 120
   notify_assets_max_shown?: number; // asset names listed per finding, 0-50, default 3
+  // Target noise profile; the stored setting wins over ARTEX_NOISE_PROFILE. Applies to the next request.
+  noise_profile?: NoiseProfileName;
+}
+
+export type NoiseProfileName = "off" | "quiet" | "balanced" | "aggressive";
+
+// GET /api/settings/noise: the current profile and its per-host counters (current minute, no reset).
+export interface NoiseStatus {
+  profile: NoiseProfileName;
+  hosts: {
+    host: string;
+    rpm: number;
+    peak_rpm: number;
+    peak_inflight: number;
+    inflight: number;
+    duplicates_avoided: number;
+  }[];
 }
 
 // ---- Vulnerability IM push ----
@@ -1368,6 +1481,20 @@ export interface InterceptPending {
   reason: string; // the rule's message or the model's verdict reason (model verdicts carry a [model] prefix)
   decided_at?: string;
   created_at: string;
+  // Deterministic risk score, computed by the server when a pending row is read.
+  risk?: InterceptRisk;
+}
+
+export interface InterceptRisk {
+  score: number; // 0..100
+  level: "low" | "medium" | "high";
+  reasons: string[];
+}
+
+export interface InterceptBatchDecideResult {
+  decided: number;
+  failed: number;
+  results: { id: number; ok: boolean; error?: string }[];
 }
 
 // JudgeConfig: global config for model fallback approval (the model decides only when no interception rule matches).
@@ -1583,6 +1710,8 @@ export interface TrafficEvidenceSnapshot {
   resp_hash: string;
   req_len: number;
   resp_len: number;
+  rewritten?: boolean;
+  rewrite_rule_ids?: number[];
 }
 export interface FindingTrafficBinding {
   id: string;
@@ -1621,4 +1750,118 @@ export interface InterceptExecution {
   session: string;
   seq: number;
   items: Activity[];
+}
+
+// ---- capture-proxy constrained Go tampering hooks (P4.2) ----
+export type TamperHookPhase = "request" | "response";
+
+export interface TamperHookHeaderMatcher {
+  name: string;
+  value_regex?: string;
+}
+
+export interface TamperHookMatchers {
+  methods?: string[];
+  host?: string;
+  url_regex?: string;
+  headers?: TamperHookHeaderMatcher[];
+  body_regex?: string;
+  status?: string[];
+  resp_headers?: TamperHookHeaderMatcher[];
+  resp_body_regex?: string;
+}
+
+export interface TamperHookLastError {
+  class: string;
+  at: string;
+  count: number;
+}
+
+export interface TamperHook {
+  id: number;
+  name: string;
+  enabled: boolean;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  source_sha256: string;
+  version: number;
+  note: string;
+  created_at: string;
+  updated_at: string;
+  load_error?: string;
+  last_error?: TamperHookLastError | null;
+}
+
+export interface TamperHooksListResp {
+  hooks: TamperHook[];
+  enabled_by_env: boolean;
+}
+
+export interface TamperHookVersion {
+  id: number;
+  hook_id: number;
+  version: number;
+  name: string;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  source_sha256: string;
+  note: string;
+  created_at: string;
+}
+
+export interface TamperHookInput {
+  name: string;
+  enabled?: boolean;
+  phase: TamperHookPhase;
+  priority: number;
+  matchers: TamperHookMatchers;
+  source: string;
+  note?: string;
+}
+
+export interface TamperDryRunIO {
+  request: {
+    method: string;
+    url: string;
+    headers: Record<string, string[]>;
+    body: string;
+  };
+  response: {
+    status: number;
+    headers: Record<string, string[]>;
+    body: string;
+  };
+}
+
+export interface TamperDryRunRequest extends TamperDryRunIO {
+  hook_id?: number;
+  name?: string;
+  phase?: TamperHookPhase;
+  matchers?: TamperHookMatchers;
+  source?: string;
+}
+
+export interface TamperTraceLine {
+  Phase: string;
+  SourceKind: string;
+  RuleID: number;
+  HookID: number;
+  HookVersion: number;
+  RuleSnapshot: string;
+  Action: string;
+  Field: string;
+  Outcome: string;
+  Reason: string;
+  BeforeHash: string;
+  AfterHash: string;
+  After: string | null;
+}
+
+export interface TamperDryRunResult extends TamperDryRunIO {
+  changed: boolean;
+  lines: TamperTraceLine[] | null;
 }

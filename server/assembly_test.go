@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 // hasSkillTool reports whether the packed tool set contains the Skill meta-tool.
@@ -28,11 +28,11 @@ func hasSkillTool(tools []actool.CoreTool) bool {
 func TestAssembleVisibleSkill(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skipf("no database config (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	pg, err := db.Open(dsn)
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer pg.Close()
 
@@ -48,7 +48,7 @@ func TestAssembleVisibleSkill(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wireAgentAugment(pg, skillDir, nil)
+	wireAgentAugment(pg, skillDir, nil, ExecPrivilege{})
 	t.Cleanup(func() { agent.SetToolAugment(nil) })
 
 	ag, _ := pg.GetAgentByKey("planner")

@@ -230,6 +230,13 @@ func (s *ExplorationStore) AddNode(kind string, payload map[string]any, priority
 		return 0, err
 	}
 	defer tx.Rollback()
+	// Validate fact anchors before creating a node. Key-share locks retain the
+	// checked assets through commit, closing the check/insert deletion race.
+	if kind == KindFact && len(anchors) > 0 {
+		if err := checkFactAnchorAssets(tx, anchors); err != nil {
+			return 0, err
+		}
+	}
 	var id int64
 	if err := tx.QueryRow(`
 INSERT INTO exploration_nodes(exploration_id, kind, payload, priority, state, origin)
@@ -243,6 +250,40 @@ VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
 		}
 	}
 	return id, tx.Commit()
+}
+
+func checkFactAnchorAssets(tx *sql.Tx, ids []int64) error {
+	rows, err := tx.Query("SELECT id FROM assets WHERE id = ANY($1::bigint[]) ORDER BY id FOR KEY SHARE", ids)
+	if err != nil {
+		return err
+	}
+	found := make(map[int64]bool, len(ids))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		found[id] = true
+	}
+	err = rows.Err()
+	closeErr := rows.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var missing []int64
+	for _, id := range ids {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("asset IDs do not exist: %v; use existing IDs or register the assets first", missing)
+	}
+	return nil
 }
 
 // AddIntent is a convenience: an open intent.
@@ -354,7 +395,10 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 
@@ -1379,14 +1423,24 @@ func (s *ExplorationStore) Stats() (map[string]int, error) {
 
 // --- activity (poll by global id cursor) ---
 
+// queryRower is the subset of *sql.DB and *sql.Tx that AppendActivity needs,
+// so a replay can insert the activity and delete the outbox row together.
+type queryRower interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 // AppendActivity records one worker step and returns its id.
 func (s *ExplorationStore) AppendActivity(a Activity) (int64, error) {
+	return s.appendActivity(s.db, a)
+}
+
+func (s *ExplorationStore) appendActivity(q queryRower, a Activity) (int64, error) {
 	metadata := a.Metadata
 	if len(metadata) == 0 {
 		metadata = json.RawMessage(`{}`)
 	}
 	var id int64
-	err := s.db.QueryRow(`
+	err := q.QueryRow(`
 INSERT INTO activity(exploration_id, node_id, worker, kind, tool, tool_use_id, is_error, summary, detail, metadata, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, main_seg)
 VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),NULLIF($5,''),NULLIF($6,''),$7,NULLIF($8,''),NULLIF($9,''),$10,$11,$12,$13,$14,$15)
 RETURNING id`, s.expID, a.NodeID, utf8Clean(a.Worker), utf8Clean(a.Kind), utf8Clean(a.Tool), utf8Clean(a.ToolUseID), a.IsError, utf8Clean(a.Summary), utf8Clean(a.Detail),
@@ -1486,11 +1540,13 @@ type TaskListMetrics struct {
 	Findings       FindingSeverityCounts // this task's vulnerability count in the findings table (bucketed by severity)
 }
 
-// TaskListMetricsAll returns list aggregates for every live task in one query.
-// The lateral lookups use the per-exploration indexes instead of grouping the
-// complete activity history on every poll.
-func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
-	rows, err := d.Query(`
+// taskListMetricsQuery is the select shared by TaskListMetricsAll and
+// TaskListMetrics; each appends its own WHERE on task. The lateral lookups use
+// the per-exploration indexes instead of grouping the complete activity history
+// on every poll. latest_activity orders by the column activity.created_at, so
+// idx_act_latest (exploration_id, created_at DESC) serves the LIMIT 1; ordering
+// by the output alias would sort every activity row of the task.
+const taskListMetricsQuery = `
 		SELECT task.exploration_id,
 		       COALESCE(token_metrics.input_tokens,0),
 		       COALESCE(token_metrics.output_tokens,0),
@@ -1514,10 +1570,10 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 			WHERE exploration_id=task.exploration_id AND kind='result'
 		) token_metrics ON true
 		LEFT JOIN LATERAL (
-			SELECT EXTRACT(EPOCH FROM created_at)::bigint AS created_at
+			SELECT EXTRACT(EPOCH FROM activity.created_at)::bigint AS created_at
 			FROM activity
-			WHERE exploration_id=task.exploration_id
-			ORDER BY created_at DESC
+			WHERE activity.exploration_id=task.exploration_id
+			ORDER BY activity.created_at DESC
 			LIMIT 1
 		) latest_activity ON true
 		LEFT JOIN LATERAL (
@@ -1539,35 +1595,57 @@ func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
 			FROM findings
 			WHERE task_id=task.id
 		) finding_metrics ON true
-		WHERE task.deleted_at IS NULL`)
+		WHERE task.deleted_at IS NULL`
+
+// scanTaskListMetrics reads one row of taskListMetricsQuery.
+func scanTaskListMetrics(row interface{ Scan(...any) error }) (int64, TaskListMetrics, error) {
+	var explorationID int64
+	var metrics TaskListMetrics
+	err := row.Scan(
+		&explorationID,
+		&metrics.Tokens.InputTokens,
+		&metrics.Tokens.OutputTokens,
+		&metrics.Tokens.CacheReadTokens,
+		&metrics.Tokens.CacheWriteTokens,
+		&metrics.LastActivity,
+		&metrics.Goals.Total,
+		&metrics.Goals.Met,
+		&metrics.RunningIntents,
+		&metrics.Findings.Critical,
+		&metrics.Findings.High,
+		&metrics.Findings.Medium,
+		&metrics.Findings.Low,
+	)
+	return explorationID, metrics, err
+}
+
+// TaskListMetricsAll returns list aggregates for every live task in one query.
+func (d *DB) TaskListMetricsAll() (map[int64]TaskListMetrics, error) {
+	rows, err := d.Query(taskListMetricsQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := map[int64]TaskListMetrics{}
 	for rows.Next() {
-		var explorationID int64
-		var metrics TaskListMetrics
-		if err := rows.Scan(
-			&explorationID,
-			&metrics.Tokens.InputTokens,
-			&metrics.Tokens.OutputTokens,
-			&metrics.Tokens.CacheReadTokens,
-			&metrics.Tokens.CacheWriteTokens,
-			&metrics.LastActivity,
-			&metrics.Goals.Total,
-			&metrics.Goals.Met,
-			&metrics.RunningIntents,
-			&metrics.Findings.Critical,
-			&metrics.Findings.High,
-			&metrics.Findings.Medium,
-			&metrics.Findings.Low,
-		); err != nil {
+		explorationID, metrics, err := scanTaskListMetrics(rows)
+		if err != nil {
 			return nil, err
 		}
 		out[explorationID] = metrics
 	}
 	return out, rows.Err()
+}
+
+// TaskListMetrics returns the same aggregates for the one live task of
+// exploration expID, with the same laterals as TaskListMetricsAll. A missing or
+// deleted task gives zero metrics, as a missing key of TaskListMetricsAll does.
+func (d *DB) TaskListMetrics(expID int64) (TaskListMetrics, error) {
+	_, metrics, err := scanTaskListMetrics(d.QueryRow(taskListMetricsQuery+` AND task.exploration_id=$1`, expID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskListMetrics{}, nil
+	}
+	return metrics, err
 }
 
 // GoalCountsAll returns goal totals (total / met) per exploration id, one query
@@ -1688,6 +1766,34 @@ FROM activity WHERE exploration_id=$1 AND id>$2 ORDER BY id LIMIT $3`, s.expID, 
 		out = append(out, a)
 	}
 	return out, cursor, rows.Err()
+}
+
+// ActivityContainingEvidence returns the newest activity recorded for nodeID
+// whose summary or full detail contains one of the given evidence lines (#124
+// row 1). ok is false when no recorded activity carries any of them. The match
+// is literal and case-sensitive: evidence has to quote the recorded output, not
+// paraphrase it. Callers pass only substantive lines, so a command name alone
+// cannot tie a claim to an activity. The activity's timestamp bounds the search
+// for a proxy capture of the same bytes.
+func (s *ExplorationStore) ActivityContainingEvidence(nodeID int64, lines []string) (id int64, createdAt time.Time, ok bool, err error) {
+	if nodeID <= 0 || len(lines) == 0 {
+		return 0, time.Time{}, false, nil
+	}
+	// One query across all lines: the newest matching activity wins, not the
+	// newest match for whichever line came first.
+	err = s.db.QueryRow(`SELECT id, created_at FROM activity a
+WHERE exploration_id=$1 AND node_id=$2
+  AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS line
+              WHERE strpos(COALESCE(a.detail,''), line) > 0
+                 OR strpos(COALESCE(a.summary,''), line) > 0)
+ORDER BY id DESC LIMIT 1`, s.expID, nodeID, lines).Scan(&id, &createdAt)
+	if err == sql.ErrNoRows {
+		return 0, time.Time{}, false, nil
+	}
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return id, createdAt, true, nil
 }
 
 // ActivityListForTerminalIntent is the inherited, incremental-read boundary.

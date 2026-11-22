@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -29,6 +30,7 @@ type TaskScope struct {
 	Value       string `json:"value,omitempty"`
 	Source      string `json:"source"`
 	Reason      string `json:"reason,omitempty"`
+	Expanded    bool   `json:"expanded,omitempty"`
 }
 
 // stripHostPort drops a trailing :port from a host:port / ip:port / [ipv6]:port
@@ -81,17 +83,17 @@ func (s *AssetStore) upsertTaskScopeResult(ts TaskScope) (bool, error) {
 		src = "auto"
 	}
 	query := `
-INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason)
-VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''))
+INSERT INTO task_scope(task_id, kind, company_id, domain, net, value, source, reason, expanded)
+VALUES ($1,$2,$3,$4,$5::cidr,$6,$7,NULLIF($8,''),$9)
 ON CONFLICT DO NOTHING`
 	var (
 		result sql.Result
 		err    error
 	)
 	if s.tx != nil {
-		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.tx.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason, ts.Expanded)
 	} else {
-		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason)
+		result, err = s.db.Exec(query, ts.TaskID, ts.Kind, companyVal, domainVal, netVal, valueVal, src, ts.Reason, ts.Expanded)
 	}
 	if err != nil {
 		return false, err
@@ -220,10 +222,92 @@ func (s *AssetStore) AddAgentScope(taskID int64, kind, value, reason, source str
 	default:
 		return ts, fmt.Errorf("unsupported kind: %s (company/root_domain/subdomain/ip/cidr/icp/keyword)", kind)
 	}
+	if source == "agent" {
+		expanded, err := s.isScopeExpansion(taskID, ts)
+		if err != nil {
+			// The declared scope could not be read, so coverage is unknown:
+			// record the addition as an expansion rather than as in-scope.
+			expanded = true
+		}
+		ts.Expanded = expanded
+	}
 	if err := s.upsertTaskScope(ts); err != nil {
 		return ts, err
 	}
 	return ts, nil
+}
+
+// isScopeExpansion reports whether adding candidate widens an already-declared
+// task scope. When the task has no declared scope yet (initial goal registration)
+// it returns false. When covered by an existing declared root_domain, company,
+// cidr/ip, or exact entry it returns false; otherwise true.
+func (s *AssetStore) isScopeExpansion(taskID int64, candidate TaskScope) (bool, error) {
+	existing, err := s.ListTaskScope(taskID)
+	if err != nil {
+		return false, err
+	}
+	var declared []TaskScope
+	for _, r := range existing {
+		if r.Source != "auto" {
+			declared = append(declared, r)
+		}
+	}
+	if len(declared) == 0 {
+		return false, nil
+	}
+	for _, r := range declared {
+		if scopeRowCovers(r, candidate) {
+			return false, nil
+		}
+	}
+	// Also check if candidate's domain is owned by an already-declared company scope.
+	if candidate.Domain != "" && s.company != nil {
+		for _, r := range declared {
+			if r.Kind == "company" && r.CompanyID != nil && *r.CompanyID > 0 {
+				var matched int
+				err := s.db.QueryRow(
+					`SELECT 1 FROM company_scope WHERE company_id=$1 AND kind IN ('root_domain','subdomain') AND ($2 = value OR $2 LIKE '%.' || value) LIMIT 1`,
+					*r.CompanyID, candidate.Domain,
+				).Scan(&matched)
+				if err == nil && matched == 1 {
+					return false, nil
+				}
+			}
+		}
+	}
+	return true, nil
+}
+
+func scopeRowCovers(existing, cand TaskScope) bool {
+	switch cand.Kind {
+	case "root_domain", "subdomain":
+		if existing.Domain == "" || cand.Domain == "" {
+			return false
+		}
+		if existing.Kind == "root_domain" {
+			return cand.Domain == existing.Domain || strings.HasSuffix(cand.Domain, "."+existing.Domain)
+		}
+		if existing.Kind == "subdomain" {
+			return cand.Domain == existing.Domain
+		}
+	case "ip", "cidr":
+		if existing.Net == "" || cand.Net == "" {
+			return false
+		}
+		_, eNet, eErr := net.ParseCIDR(existing.Net)
+		cIP, cNet, cErr := net.ParseCIDR(cand.Net)
+		if eErr != nil || cErr != nil {
+			return false
+		}
+		eOnes, eBits := eNet.Mask.Size()
+		cOnes, cBits := cNet.Mask.Size()
+		return eBits == cBits && eOnes <= cOnes && eNet.Contains(cIP)
+	case "company":
+		return existing.Kind == "company" && existing.CompanyID != nil && cand.CompanyID != nil && *existing.CompanyID == *cand.CompanyID
+	case "icp", "keyword":
+		return existing.Kind == cand.Kind && strings.EqualFold(existing.Value, cand.Value)
+	}
+	return false
 }
 
 // DeleteTaskScope removes a single scope row by id, scoped to the given task.
@@ -241,7 +325,7 @@ func (s *AssetStore) DeleteTaskScope(taskID, scopeID int64) (bool, error) {
 func (s *AssetStore) ListTaskScope(taskID int64) ([]TaskScope, error) {
 	rows, err := s.db.Query(`
 SELECT ts.id, ts.kind, COALESCE(ts.company_id,0), COALESCE(c.name,''), COALESCE(ts.domain,''),
-       COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,'')
+       COALESCE(ts.net::text,''), COALESCE(ts.value,''), ts.source, COALESCE(ts.reason,''), COALESCE(ts.expanded,false)
 FROM task_scope ts
 LEFT JOIN companies c ON c.id=ts.company_id
 WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
@@ -253,7 +337,7 @@ WHERE ts.task_id=$1 ORDER BY ts.id`, taskID)
 	for rows.Next() {
 		var t TaskScope
 		var cid int64
-		if err := rows.Scan(&t.ID, &t.Kind, &cid, &t.CompanyName, &t.Domain, &t.Net, &t.Value, &t.Source, &t.Reason); err != nil {
+		if err := rows.Scan(&t.ID, &t.Kind, &cid, &t.CompanyName, &t.Domain, &t.Net, &t.Value, &t.Source, &t.Reason, &t.Expanded); err != nil {
 			return nil, err
 		}
 		t.TaskID = taskID
@@ -296,17 +380,22 @@ type Coverage struct {
 }
 
 // CoverageEnabled reports whether a task has the asset-coverage feature turned on
-// (tasks.coverage_enabled). Missing row / error → true (fail open to the default),
-// so unknown/legacy tasks keep the historical behavior. taskID<=0 → true.
-func (s *AssetStore) CoverageEnabled(taskID int64) bool {
+// (tasks.coverage_enabled). A missing row stays enabled, which is the historical
+// default for unknown and legacy tasks. taskID<=0 stays enabled. A query error is
+// returned with enabled=true so a database blip does not turn the feature off.
+func (s *AssetStore) CoverageEnabled(taskID int64) (bool, error) {
 	if taskID <= 0 {
-		return true
+		return true, nil
 	}
 	var enabled bool
-	if err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled,true) FROM tasks WHERE id=$1`, taskID).Scan(&enabled); err != nil {
-		return true
+	err := s.db.QueryRow(`SELECT COALESCE(coverage_enabled,true) FROM tasks WHERE id=$1`, taskID).Scan(&enabled)
+	if err == sql.ErrNoRows {
+		return true, nil
 	}
-	return enabled
+	if err != nil {
+		return true, err
+	}
+	return enabled, nil
 }
 
 // declaredScopeFilter keeps a task_scope row ts in the coverage match only when it is
@@ -534,16 +623,44 @@ ORDER BY a.id`, taskID)
 			}
 		}
 	}
+	// One query for every missing root instead of one per root.
+	roots := make([]string, 0, len(missingRoots))
 	for root := range missingRoots {
-		var id, companyID int64
-		err := s.db.QueryRow(`SELECT id, COALESCE(company_id,0) FROM assets
-WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	type rootRow struct{ id, companyID int64 }
+	rootRows := map[string]rootRow{}
+	if len(roots) > 0 {
+		rrows, err := s.db.Query(`SELECT domain, id, COALESCE(company_id,0) FROM assets
+WHERE type='root_domain' AND domain=ANY($1::text[]) ORDER BY id`, roots)
+		if err != nil {
+			return nil, err
+		}
+		for rrows.Next() {
+			var domain string
+			var r rootRow
+			if err := rrows.Scan(&domain, &r.id, &r.companyID); err != nil {
+				rrows.Close()
+				return nil, err
+			}
+			if _, ok := rootRows[domain]; !ok {
+				rootRows[domain] = r
+			}
+		}
+		err = rrows.Err()
+		rrows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, root := range roots {
 		var node CoverageGraphNode
-		if err == nil && id > 0 {
-			node = CoverageGraphNode{Key: assetKey(id), Kind: "root_domain", AssetID: id,
-				CompanyID: companyID, Domain: root, Label: root}
-			if companyID > 0 {
-				companyIDs[companyID] = true
+		if r, ok := rootRows[root]; ok && r.id > 0 {
+			node = CoverageGraphNode{Key: assetKey(r.id), Kind: "root_domain", AssetID: r.id,
+				CompanyID: r.companyID, Domain: root, Label: root}
+			if r.companyID > 0 {
+				companyIDs[r.companyID] = true
 			}
 		} else {
 			node = CoverageGraphNode{Key: "r:" + root, Kind: "root_domain", Domain: root, Label: root}
@@ -552,18 +669,34 @@ WHERE type='root_domain' AND domain=$1 LIMIT 1`, root).Scan(&id, &companyID)
 		rootByDomain[root] = node.Key
 	}
 
-	// Company nodes for every referenced company id — always gray context.
+	// Company nodes for every referenced company id — always gray context. One
+	// query for all of them; an id with no company row gets no node.
+	ids := make([]int64, 0, len(companyIDs))
 	for id := range companyIDs {
-		key := companyKey(id)
-		if _, ok := byKey[key]; ok {
-			continue
+		if _, ok := byKey[companyKey(id)]; !ok {
+			ids = append(ids, id)
 		}
-		var name string
-		if err := s.db.QueryRow(`SELECT name FROM companies WHERE id=$1`, id).Scan(&name); err != nil {
-			continue
+	}
+	if len(ids) > 0 {
+		crows, err := s.db.Query(`SELECT id, name FROM companies WHERE id=ANY($1::bigint[]) ORDER BY id`, ids)
+		if err != nil {
+			return nil, err
 		}
-		add(CoverageGraphNode{Key: key, Kind: "company", CompanyID: id,
-			Label: name, AssetID: 0})
+		for crows.Next() {
+			var id int64
+			var name string
+			if err := crows.Scan(&id, &name); err != nil {
+				crows.Close()
+				return nil, err
+			}
+			add(CoverageGraphNode{Key: companyKey(id), Kind: "company", CompanyID: id,
+				Label: name, AssetID: 0})
+		}
+		err = crows.Err()
+		crows.Close()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Derived containment edges (only when the parent node exists).

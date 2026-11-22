@@ -502,11 +502,126 @@ func assetDisplayName(typ, domain, ip, url, appName, bundleID string) string {
 //     already succeeded and the caller must not report an error for it.
 func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status string) (from string, found bool, notified bool, err error) {
 	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		var changed bool
 		var txErr error
-		from, found, _, notified, txErr = SetFindingStatusTx(ctx, tx, id, status)
-		return txErr
+		from, found, changed, notified, txErr = SetFindingStatusTx(ctx, tx, id, status)
+		if txErr != nil {
+			return txErr
+		}
+		if found && changed {
+			return syncLessonsForFindingTx(ctx, tx, id)
+		}
+		return nil
 	})
-	return from, found, notified, err
+	if err != nil {
+		return from, found, false, err
+	}
+	return from, found, notified, nil
+}
+
+// FindingStatusBatchResult is one id's outcome in a bulk status update.
+type FindingStatusBatchResult struct {
+	ID       int64  `json:"id"`
+	From     string `json:"from,omitempty"`
+	Found    bool   `json:"found"`
+	Changed  bool   `json:"changed"`
+	Notified bool   `json:"notified"`
+}
+
+// SetFindingStatusesWithNotify updates several findings to the same status in one
+// transaction. It returns a result per id, so an unknown id is reported as
+// found=false instead of hiding the others; a database error rolls the whole
+// batch back. Notification semantics stay identical to the single-row path: one
+// delivery event per finding whose status actually changed, none for a no-op.
+func (d *DB) SetFindingStatusesWithNotify(ctx context.Context, ids []int64, status string) ([]FindingStatusBatchResult, error) {
+	out := make([]FindingStatusBatchResult, 0, len(ids))
+	err := d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		changedIDs := make([]int64, 0, len(ids))
+		for _, id := range ids {
+			from, found, changed, notified, err := SetFindingStatusTx(ctx, tx, id, status)
+			if err != nil {
+				return err
+			}
+			if changed {
+				changedIDs = append(changedIDs, id)
+			}
+			out = append(out, FindingStatusBatchResult{ID: id, From: from, Found: found, Changed: changed, Notified: notified})
+		}
+		return syncLessonsForFindingsTx(ctx, tx, changedIDs)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GoalInvalidatingFindingStatuses is the single source of truth for finding
+// triage statuses that mean "not a valid vulnerability" and therefore cannot
+// prove or keep a goal met (#269). Both db goal-reopen logic and agent
+// prove_goal checks use this list so they cannot drift.
+//
+// FindingRiskAccepted is deliberately excluded: it represents a real finding
+// whose risk is accepted, not an invalid one, so it may prove a goal and must
+// never reopen one.
+var GoalInvalidatingFindingStatuses = []string{
+	FindingFalsePositive,
+	FindingDuplicate,
+	FindingIgnored,
+}
+
+// FindingStatusInvalidatesGoal reports whether a finding disposition means the
+// finding is not a valid vulnerability and therefore cannot prove or keep a
+// goal met.
+func FindingStatusInvalidatesGoal(status string) bool {
+	s := strings.ToLower(strings.TrimSpace(status))
+	for _, inv := range GoalInvalidatingFindingStatuses {
+		if s == inv {
+			return true
+		}
+	}
+	return false
+}
+
+// reopenGoalsProvedByNodeTx resets any goal node proved by nodeID back to open
+// inside the caller's transaction, unless another valid proof still exists for
+// that goal (a finding whose status is not in GoalInvalidatingFindingStatuses,
+// or an observed non-target_response non-unverified fact matching prove_goal's
+// gate). All proves edges are preserved for history; only the goal state changes.
+func reopenGoalsProvedByNodeTx(ctx context.Context, tx *sql.Tx, nodeID int64) error {
+	_, err := tx.ExecContext(ctx, `
+		UPDATE exploration_nodes g
+		SET state = 'open',
+		    blocked_reason = NULL,
+		    content_version = content_version + 1
+		FROM exploration_edges e
+		WHERE e.src_id = $1
+		  AND e.rel = $2
+		  AND g.id = e.dst_id
+		  AND g.kind = $3
+		  AND g.state = 'met'
+		  AND NOT EXISTS (
+			SELECT 1
+			FROM exploration_edges pe
+			JOIN exploration_nodes src ON src.id = pe.src_id
+			WHERE pe.dst_id = g.id
+			  AND pe.rel = $2
+			  AND src.id <> $1
+			  AND (
+				(src.kind = $4 AND EXISTS (
+					SELECT 1
+					FROM findings f
+					WHERE f.node_id = src.id
+					  AND NOT (LOWER(BTRIM(f.status)) = ANY($6::text[]))
+				))
+				OR
+				(src.kind = $5
+				 AND LOWER(BTRIM(COALESCE(src.payload->>'confidence', ''))) = 'observed'
+				 AND LOWER(BTRIM(COALESCE(src.payload->>'source', ''))) <> 'target_response'
+				 AND LOWER(BTRIM(COALESCE(src.payload->>'provenance', ''))) <> 'unverified')
+			  )
+		  )`,
+		nodeID, RelProves, KindGoal, KindFinding, KindFact, GoalInvalidatingFindingStatuses)
+	return err
 }
 
 // SetFindingStatusTx updates a finding's status and registers a status-change delivery
@@ -525,12 +640,12 @@ func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status st
 func SetFindingStatusTx(ctx context.Context, tx *sql.Tx, id int64, status string) (from string, found bool, changed bool, notified bool, err error) {
 	var (
 		vulnclass, name, severity, summary string
-		taskID                             sql.NullInt64
+		taskID, nodeID                     sql.NullInt64
 		assetIDs                           []byte
 	)
-	scanErr := tx.QueryRowContext(ctx, `SELECT vulnclass, name, severity, summary, task_id, asset_ids, status
+	scanErr := tx.QueryRowContext(ctx, `SELECT vulnclass, name, severity, summary, task_id, asset_ids, status, node_id
 FROM findings WHERE id=$1 FOR UPDATE`, id).
-		Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs, &from)
+		Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs, &from, &nodeID)
 	if scanErr == sql.ErrNoRows {
 		return "", false, false, false, nil
 	}
@@ -545,6 +660,18 @@ FROM findings WHERE id=$1 FOR UPDATE`, id).
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET status=$2 WHERE id=$1`, id, status); err != nil {
 		return from, true, false, false, err
+	}
+	if nodeID.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE exploration_nodes
+			SET payload = jsonb_set(payload, '{status}', to_jsonb($1::text))
+			WHERE id = $2`, status, nodeID.Int64); err != nil {
+			return from, true, false, false, err
+		}
+		if FindingStatusInvalidatesGoal(status) {
+			if err := reopenGoalsProvedByNodeTx(ctx, tx, nodeID.Int64); err != nil {
+				return from, true, false, false, err
+			}
+		}
 	}
 	var assets []int64
 	_ = json.Unmarshal(assetIDs, &assets)

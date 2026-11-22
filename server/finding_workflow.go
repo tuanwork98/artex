@@ -29,6 +29,16 @@ func (s *Server) seedFindingWorkflowTools() {
 			_ = s.m.pg.SetSetting(hostSearchDescriptionFlag, "true")
 		}
 	}
+	const getRewriteDescriptionFlag = "traffic_get_rewrite_description_v1"
+	if value, _, _ := s.m.pg.GetSetting(getRewriteDescriptionFlag); value != "true" {
+		// Same rule: only the original built-in text is replaced.
+		legacy := "Fetch the raw request/response of one captured traffic record by id (truncated when too large). Use together with traffic_search to avoid re-curling. A WebSocket (status 101) or SSE (text/event-stream) record shows only its handshake here; read its messages with traffic_messages."
+		if _, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now() WHERE key='traffic_get' AND system AND description=$2`, traffic.TrafficGetDescription, legacy); err != nil {
+			log.Printf("[evidence] upgrade traffic_get description: %v", err)
+		} else {
+			_ = s.m.pg.SetSetting(getRewriteDescriptionFlag, "true")
+		}
+	}
 	const flag = "finding_workflow_tools_v2_reporter"
 	if value, _, _ := s.m.pg.GetSetting(flag); value == "true" {
 		return
@@ -88,7 +98,7 @@ func (s *Server) seedFindingWorkflowTools() {
 	// Upgrade only the original default binding. Customized lists and enabled
 	// flags survive; the one-time flag also preserves future user unbinding.
 	readers := `["worker","reporter"]`
-	for _, key := range []string{"traffic_search", "traffic_get", "traffic_blob"} {
+	for _, key := range []string{"traffic_search", "traffic_get", "traffic_blob", "traffic_messages"} {
 		if _, err := s.m.pg.Exec(`UPDATE tools SET agents=$2::jsonb WHERE key=$1 AND system AND (agents='["worker"]'::jsonb OR (agents @> '["worker","planner","mainagent","auto","pentest"]'::jsonb AND jsonb_array_length(agents)=5))`, key, readers); err != nil {
 			return
 		}

@@ -1,5 +1,5 @@
 // Package agent wires real LLM-driven planner and work agents (on top of the
-// agent-core SDK) to the dual SQLite graph. See the ARTEX architecture design doc
+// agent-core SDK) to the dual PostgreSQL graph. See the ARTEX architecture design doc
 // §4.3 (planner) and §4.4 (work agent).
 //
 // Provider configuration is read from the environment so the system runs with
@@ -27,6 +27,7 @@ import (
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -44,8 +45,9 @@ type Config struct {
 	// using the provider (0 = that window unlimited).
 	RatePerSecond float64
 	RatePerMinute float64
-	// ContextWindowK is the model's context window in K tokens (user-configured),
-	// used to size compaction thresholds. 0 = default; see CompactionWindow.
+	// ContextWindowK is the model's context window in K tokens (user-configured).
+	// CompactionWindow applies a 32K floor for compaction math; ContextWindowTokens
+	// does not, so routing and side-question budgets see the real window. 0 = default.
 	ContextWindowK int
 	// ThinkingType independently controls the thinking "on/off" field (thinking.type):
 	//   "" = don't send (default, compatible with models that don't support the field);
@@ -182,6 +184,22 @@ func (c Config) CompactionWindow() int {
 	}
 	if k < minWindowK {
 		k = minWindowK
+	}
+	if k > maxWindowK {
+		k = maxWindowK
+	}
+	return k * 1000
+}
+
+// ContextWindowTokens returns the model's actual configured context window in
+// tokens (0/unset → 200K, capped at 1M) without the 32K compaction-math floor.
+// llmpool pre-filtering and sidequestion budgets use this so an 8K/16K profile
+// is not treated as 32K — that leak lets an oversize request hit the small
+// model, 400, and never fail over (shouldFailover ignores 400s).
+func (c Config) ContextWindowTokens() int {
+	k := c.ContextWindowK
+	if k <= 0 {
+		k = defaultWindowK
 	}
 	if k > maxWindowK {
 		k = maxWindowK
@@ -631,6 +649,7 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	reply, err := agentcore.Run(ctx, agentcore.Options{
 		Provider:       prov,
 		SystemPrompt:   []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
+		Tools:          []actool.CoreTool{}, // not nil: nil means the SDK's unconfined file and shell tools
 		PermissionMode: acperm.ModeBypass,
 		MaxTurns:       1,
 		MaxTokens:      8192,

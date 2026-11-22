@@ -79,8 +79,10 @@ var errWorkControlConflict = errors.New("work control conflict")
 // retryableWorkerModelError excludes errors already handled by the task router.
 // In particular, a quota error after partial streaming advances the task cursor
 // for the next LLM call but must not replay this whole intent on the backup.
+// A NOA budget refusal is deterministic and never reached the provider, so a
+// rerun would only fail the same way.
 func retryableWorkerModelError(reason harness.TerminalReason, err error) bool {
-	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err)
+	return reason == harness.ReasonModelError && !isTaskLLMRuntimeError(err) && !errors.Is(err, agent.ErrNoaBudget)
 }
 
 // Engine drives the event-driven exploration loop with real LLM agents
@@ -116,6 +118,7 @@ type Engine struct {
 	// runs under one task-scoped context. Successful deletion cancels that context,
 	// waits for all goroutines, then releases every task-level Engine reference.
 	runtimeMu sync.Mutex
+	draining  bool
 	runtimes  map[string]*taskRuntime
 
 	// per-task execution context: each planner.Plan / worker.Execute runs under it,
@@ -160,7 +163,7 @@ type Engine struct {
 
 type taskRuntime struct {
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 	wg     sync.WaitGroup
 }
 
@@ -229,9 +232,12 @@ func (e *Engine) IsDeleting(taskID string) bool {
 func (e *Engine) registerTaskRoutines(parent context.Context, taskID string, count int) *taskRuntime {
 	e.runtimeMu.Lock()
 	defer e.runtimeMu.Unlock()
+	if e.draining {
+		return nil
+	}
 	rt := e.runtimes[taskID]
 	if rt == nil {
-		ctx, cancel := context.WithCancel(parent)
+		ctx, cancel := context.WithCancelCause(parent)
 		rt = &taskRuntime{ctx: ctx, cancel: cancel}
 		e.runtimes[taskID] = rt
 	}
@@ -246,6 +252,61 @@ func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
 	}()
 }
 
+// Wait blocks until the task goroutines registered at the moment of the call,
+// and every admitted task operation, have finished, or until ctx ends. It
+// refuses new registrations and new beginTaskOperation calls first. Goroutines
+// that were already running are cancelled with AbortShutdown. That cancel does
+// not write a terminal task status, and an in-flight intent claim stays running
+// so the next start can reset it to open. Detached chat runs are not in a task
+// WaitGroup; they are counted in inflight and Wait stays until they return.
+func (e *Engine) Wait(ctx context.Context) error {
+	if e == nil {
+		return nil
+	}
+	e.runtimeMu.Lock()
+	e.draining = true
+	groups := make([]*sync.WaitGroup, 0, len(e.runtimes))
+	for _, rt := range e.runtimes {
+		if rt == nil {
+			continue
+		}
+		if rt.cancel != nil {
+			rt.cancel(agent.AbortShutdown)
+		}
+		groups = append(groups, &rt.wg)
+	}
+	e.runtimeMu.Unlock()
+	for _, wg := range groups {
+		if err := waitGroup(ctx, wg); err != nil {
+			return err
+		}
+	}
+	for e.inflightTotal() > 0 {
+		timer := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func waitGroup(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // StopTask permanently stops every long-lived goroutine and removes all Engine
 // state for a successfully deleted task. The delete barrier remains installed
 // until cleanup finishes, so no new task operation can race the teardown.
@@ -258,7 +319,7 @@ func (e *Engine) StopTask(taskID string) {
 	e.runtimeMu.Lock()
 	rt := e.runtimes[taskID]
 	if rt != nil {
-		rt.cancel()
+		rt.cancel(agent.AbortTaskDeleted)
 	}
 	e.runtimeMu.Unlock()
 	if rt != nil {
@@ -611,6 +672,14 @@ func (h steerHooks) Stop(ctx context.Context, messages []llm.Message) (bool, []s
 	if prevent || len(blocking) > 0 || h.nudges == nil || h.limit <= 0 || !isThinkingOnlyTurn(messages) {
 		return prevent, blocking, msg
 	}
+	// A refused turn is empty as well, but there the provider declined the request;
+	// the model did not think and forget to act. A rerun resends the same
+	// conversation and is refused again, so let the run end and be reported as a
+	// refusal (terminalText) instead.
+	if stop := agent.LastStopReason(ctx); agent.IsRefusalStop(stop) {
+		log.Printf("[work %s] provider refused the turn (stop_reason=%s), not injecting an idle-turn rerun", h.label, stop)
+		return prevent, blocking, msg
+	}
 	n := h.nudges.Add(1)
 	if n > int64(h.limit) {
 		log.Printf("[work %s] idle turns (thinking only, no body text, no tools) reached the rerun cap %d, letting it finish", h.label, h.limit)
@@ -662,6 +731,23 @@ func (e *Engine) emitActivity(t *Task, r db.Activity) db.Activity {
 		}
 		log.Printf("[activity] task %s dropping activity record (%d dropped for this task so far) worker=%s kind=%s tool=%s tuid=%s reason=%s summary=%q: %v%s",
 			t.ID, n, r.Worker, r.Kind, r.Tool, r.ToolUseID, dropReason(err), preview(r.Summary, 80), err, diag)
+		if t.Store != nil {
+			if qerr := t.Store.EnqueueActivity(r, err.Error()); qerr != nil {
+				log.Printf("[activity] task %s outbox: %v", t.ID, qerr)
+			}
+		}
+		// The row has no database id. Publish an error copy so a live session
+		// does not stay on "Running" while the original return value is unchanged.
+		notice := r
+		notice.IsError = true
+		if notice.Summary == "" {
+			notice.Summary = "activity was not stored"
+		} else {
+			notice.Summary += " (not stored)"
+		}
+		if e.bc != nil {
+			e.bc.Publish(t.ID, notice)
+		}
 		e.touch(t.ID)
 		return r
 	}
@@ -760,6 +846,10 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 2+workers)
 	e.deleteMu.RUnlock()
+	if rt == nil {
+		e.started.Delete(t.ID)
+		return
+	}
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.claimSweepLoop(loopCtx, t) })
@@ -1092,6 +1182,27 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 	return e.runIntent(ctx, t, name, worker, intent, token, "", "")
 }
 
+// intentWorkContext resolves the cached per-task exec context and returns a
+// per-intent child context with the rotated LLM profile pin attached (#85,
+// #376). Attaching the pin after execContextFor ensures a cached e.execCtx
+// does not drop it; attaching it after the paused/deleting check ensures a
+// rolled-back claim never advances the rotation counter.
+func (e *Engine) intentWorkContext(ctx context.Context, t *Task) (ectx, workCtx context.Context, workCancel context.CancelCauseFunc, ok bool) {
+	ectx = e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; carries the task deadline
+	if ectx.Err() != nil || e.IsDeleting(t.ID) {
+		return ectx, nil, nil, false
+	}
+	// per-work child context so the planner's kill_work can stop just this work.
+	workCtx, workCancel = context.WithCancelCause(ectx)
+	// Per-intent LLM rotation (#85): each claimed worker intent runs on the
+	// next chain head. The pin travels through the run context into the
+	// provider resolver; non-worker roles and failover keep the active head.
+	if head, pinned := t.nextRotatedProfile(); pinned {
+		workCtx = withLLMProfilePin(workCtx, head)
+	}
+	return ectx, workCtx, workCancel, true
+}
+
 // runIntent executes and fully settles one already-claimed (state=running) intent.
 // Both the pool worker loop (via runWorkerStep) and the human-message handler (via
 // runDetachedIntent, a dedicated goroutine outside the worker pool) call it, so the
@@ -1104,27 +1215,17 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // while the worker is busy, and every intent state write below is fenced on it,
 // so a worker whose claim was taken over cannot overwrite the new claimer.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, token, requestID, message string) bool {
-	// Per-intent LLM rotation (#85): each claimed worker intent runs on the
-	// next chain head. The pin travels through the run context into the
-	// provider resolver; non-worker roles and failover keep the active head.
-	if t.LLMRotate {
-		if head, ok := t.nextRotatedProfile(); ok {
-			ctx = withLLMProfilePin(ctx, head)
-		}
-	}
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // first real execution → stamp first_run_at + compute the deadline (only for tasks with a timeout)
 	e.touch(t.ID)
 	emit := func(r db.Activity) { e.emitActivity(t, r) }
-	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; carries the task deadline
-	if ectx.Err() != nil || e.IsDeleting(t.ID) {
+	ectx, workCtx, workCancel, ok := e.intentWorkContext(ctx, t)
+	if !ok {
 		if err := t.Store.SettleIntentClaim(intent.ID, token, "open"); err != nil {
 			log.Printf("[worker %s] task %s intent #%d claim rollback failed: %v", name, t.ID, intent.ID, err)
 		}
 		return true
 	}
-	// per-work child context so the planner's kill_work can stop just this work.
-	workCtx, workCancel := context.WithCancelCause(ectx)
 	e.registerWork(intent.ID, workCancel)
 	stopHeartbeat := startClaimHeartbeat(t.Store, db.IntentClaimHeartbeatInterval, name, intent.ID, token, workCancel)
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
@@ -1266,6 +1367,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		e.touch(t.ID)
 		return true
 	}
+	// Process shutdown cancels the task context. Leave the claim running: AbortShutdown
+	// says restart resets leftover running intents to open. Settling done or blocked
+	// here would make that reset miss the intent, so the task would resume without it.
+	if ectx.Err() != nil && errors.Is(context.Cause(ectx), agent.AbortShutdown) {
+		log.Printf("[worker %s] task %s intent #%d shutdown: leaving the claim running", name, t.ID, intent.ID)
+		return true
+	}
 	// killed by the planner: mark stopped (don't write back results, don't auto-reclaim).
 	if killed {
 		if err := t.Store.SettleIntentClaim(intent.ID, token, "stopped"); err != nil {
@@ -1324,7 +1432,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 // be started; the intent is left untouched in that case.
 func (e *Engine) runDetachedIntent(ctx context.Context, t *Task, intentID int64, requestID, message, agentMessage string) error {
 	if !e.beginTaskOperation(t.ID) {
-		return fmt.Errorf("task is being deleted")
+		return fmt.Errorf("task is not accepting work")
 	}
 	release := true
 	defer func() {

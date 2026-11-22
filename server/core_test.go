@@ -20,11 +20,13 @@ import (
 func TestCoreTaskLifecyclePG(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		db.SkipPGUnavailable(t, err)
 	}
 	defer m.Close()
 	td := t.TempDir()
-	s := New(context.Background(), m, td, td, td)
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(ctx, m, td, td, td)
+	defer stopTestServer(t, s, cancel)
 	h := s.Handler()
 	tok, err := signJWT(s.jwtKey)
 	if err != nil {
@@ -71,6 +73,9 @@ func TestCoreTaskLifecyclePG(t *testing.T) {
 	if id == "" || expID == 0 {
 		t.Fatalf("bad task payload: %v", out)
 	}
+	defer func() {
+		_, _ = m.pg.Exec(`DELETE FROM assets WHERE type = 'ip' AND ip = '127.0.0.1'`)
+	}()
 
 	// the exploration owns goal node(s) — goal seeding is async, poll briefly
 	var goals []*db.Node

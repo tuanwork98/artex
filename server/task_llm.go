@@ -15,6 +15,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/llmpool"
 	"github.com/Autumn-27/artex/llmrec"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/transcript"
@@ -137,8 +138,15 @@ func resetLLMFailStreak(taskID string, profileID int64) {
 type taskLLMSelection struct {
 	task      *Task
 	profileID int64
-	revision  int64
-	provider  llm.Provider
+	// healthProfileID is the llm_profiles row whose breaker state the calls on
+	// this selection update. It equals profileID on the task-chain path; a bound
+	// agent or the global provider carries its own id here while profileID stays
+	// 0 (no chain semantics). 0 means "do not report": either there is no
+	// profile (environment-only configuration) or the provider is already the
+	// failover Pool, which updates the registry itself.
+	healthProfileID int64
+	revision        int64
+	provider        llm.Provider
 	// retry holds the retry parameters resolved for the profile selected this time (profile override → global policy → built-in default).
 	// Same-provider safe-window retries follow it, so switching profiles switches the retry cadence.
 	retry agent.RetryConfig
@@ -165,22 +173,38 @@ type taskLLMStreamHooks struct {
 	current    func(context.Context) (taskLLMSelection, error)
 	exhaust    func(taskLLMSelection, error) (db.TaskLLMTransition, error)
 	transition func(taskLLMSelection, db.TaskLLMTransition, error)
+	// recordHealth reports one physical provider attempt to the process-wide
+	// breaker. It keeps /system/llm/ truthful for every selection whose provider
+	// is not already the failover Pool (the chain, a bound agent, the global
+	// profile). Optional: test literals leave it nil and the call sites skip it.
+	recordHealth func(ctx context.Context, profileID int64, stream, committed bool, err error)
 }
 
-// current resolves the provider this role runs on, by precedence:
-// Agent binding → task LLM profile chain → global/environment configuration.
+// healthIDFor returns the profile whose breaker state a call on this provider
+// should update. It returns 0 when there is no profile, or when the provider is
+// the failover Pool, which records every member attempt itself.
+func healthIDFor(prov llm.Provider, profileID int64) int64 {
+	if profileID == 0 {
+		return 0
+	}
+	if _, pooled := prov.(*llmpool.Pool); pooled {
+		return 0
+	}
+	return profileID
+}
+
+// currentFor resolves the provider this role runs on, by precedence:
+// Agent binding → task LLM profile chain → global/environment configuration,
+// honoring a per-run profile pin set by the engine for per-intent rotation (#85).
 // Binding wins over the task chain: a role explicitly assigned a model keeps running
 // on that model; only when the binding is missing or fails to build does it fall back
 // to the task chain, and to the global configuration when the chain is empty.
-// The returned profile id is non-zero only on the task-chain path — streamTaskLLM uses it to decide whether a quota error should advance the task's failover state (binding/global paths leave the chain state untouched, preserving existing semantics).
-func (r *taskLLMRuntime) current() (taskLLMSelection, error) {
-	return r.currentFor(context.Background())
-}
-
-// currentFor resolves like current, honoring a per-run profile pin set by the
-// engine for per-intent rotation (#85). A pin is only a dispatch preference:
-// the chain must still be in a ready state (an exhausted chain with no active
-// head stays exhausted) and the pinned id must belong to the task's chain.
+// A pin is only a dispatch preference: the chain must still be in a ready state
+// (an exhausted chain with no active head stays exhausted) and the pinned id must
+// belong to the task's chain. The returned profile id is non-zero only on the
+// task-chain path — streamTaskLLM uses it to decide whether a quota error should
+// advance the task's failover state (binding/global paths leave the chain state
+// untouched, preserving existing semantics).
 func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, error) {
 	taskNum, err := parseTaskID(r.taskID)
 	if err != nil {
@@ -196,8 +220,9 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 	r.s.syncTaskLLMState(pt)
 	t, _ := r.s.m.Task(r.taskID)
 	sel := taskLLMSelection{task: t, revision: pt.LLMChainRevision}
-	if prov, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+	if prov, cfg, id, ok := r.s.agentBindingProvider(r.agentKey); ok {
 		sel.provider, sel.retry = prov, cfg.Retry
+		sel.healthProfileID = healthIDFor(prov, id)
 		return sel, nil
 	}
 	if len(pt.LLMProfileIDs) > 0 {
@@ -206,7 +231,7 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 		}
 		sel.profileID = *pt.ActiveLLMProfileID
 		if pin, ok := llmProfilePinFrom(ctx); ok && pin != sel.profileID {
-			for _, id := range pt.LLMProfileIDs {
+			for _, id := range pt.ReadyLLMProfileIDs {
 				if id == pin {
 					sel.profileID = pin
 					break
@@ -218,13 +243,15 @@ func (r *taskLLMRuntime) currentFor(ctx context.Context) (taskLLMSelection, erro
 			return sel, fmt.Errorf("LLM profile #%d is missing or invalid", sel.profileID)
 		}
 		sel.provider, sel.retry = prov, cfg.Retry
+		sel.healthProfileID = sel.profileID // chain selections never go through the Pool
 		return sel, nil
 	}
-	prov, cfg, ok := r.s.globalProvider()
+	prov, cfg, id, ok := r.s.globalProviderWithProfile()
 	if !ok {
 		return sel, fmt.Errorf("task %s has no available fallback LLM provider", r.taskID)
 	}
 	sel.provider, sel.retry = prov, cfg.Retry
+	sel.healthProfileID = healthIDFor(prov, id)
 	return sel, nil
 }
 
@@ -242,7 +269,7 @@ func (r *taskLLMRuntime) activeCfg() (agent.Config, bool) {
 	if err != nil || pt == nil {
 		return agent.Config{}, false
 	}
-	if _, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+	if _, cfg, _, ok := r.s.agentBindingProvider(r.agentKey); ok {
 		return cfg, true
 	}
 	if len(pt.LLMProfileIDs) > 0 && pt.ActiveLLMProfileID != nil {
@@ -280,10 +307,19 @@ func parseTaskID(id string) (int64, error) {
 
 // streamHooks builds the failover/exhaustion callbacks shared by Stream and
 // Complete: how to read the current profile selection, how to mark it quota
-// exhausted, and how to emit a failover transition.
+// exhausted, how to emit a failover transition, and how to report breaker
+// health for providers that are not the failover Pool.
 func (r *taskLLMRuntime) streamHooks() taskLLMStreamHooks {
 	return taskLLMStreamHooks{
 		current: func(ctx context.Context) (taskLLMSelection, error) { return r.currentFor(ctx) },
+		recordHealth: func(ctx context.Context, profileID int64, stream, committed bool, err error) {
+			if profileID == 0 || r.s == nil || r.s.llmHealth == nil {
+				return
+			}
+			if tripped, msg := r.s.llmHealth.RecordCall(ctx, profileID, stream, committed, err); tripped {
+				log.Printf("[task-llm] profile #%d breaker tripped: %s", profileID, msg)
+			}
+		},
 		exhaust: func(selection taskLLMSelection, cause error) (db.TaskLLMTransition, error) {
 			taskNum, _ := parseTaskID(r.taskID)
 			transition, err := r.s.m.pg.MarkTaskLLMProfileQuotaExhaustedAtRevision(taskNum, selection.profileID, selection.revision, cause.Error())
@@ -317,10 +353,14 @@ func (r *taskLLMRuntime) Complete(ctx context.Context, req llm.CompletionRequest
 }
 
 func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest, hooks taskLLMStreamHooks) (llm.Message, string, llm.Usage, error) {
+	// total is the usage of the logical call: the sum of every physical attempt
+	// (same-provider retries and profile failover). Each attempt is already billed
+	// once by the recorder below; this sum only feeds the caller's accounting.
+	var total llm.Usage
 	for {
 		selection, err := hooks.current(ctx)
 		if err != nil {
-			return llm.Message{}, "", llm.Usage{}, err
+			return llm.Message{}, "", total, err
 		}
 		var (
 			msg     llm.Message
@@ -333,13 +373,17 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		retries, backoffOf := sameProviderRetryPolicy(selection.retry)
 		for attempt := 0; ; attempt++ {
 			msg, sr, usage, callErr = selection.provider.Complete(ctx, req)
+			total.Add(usage)
+			if hooks.recordHealth != nil {
+				hooks.recordHealth(ctx, selection.healthProfileID, false, false, callErr)
+			}
 			if callErr != nil && ctx.Err() == nil &&
 				attempt < retries && isRetryableStreamError(callErr) {
 				backoff := backoffOf(attempt)
 				log.Printf("[task-llm] task %s non-streaming call failed, retrying on the same provider after %v (%d/%d): %v",
 					taskID, backoff, attempt+1, retries, callErr)
 				if sleepCtx(ctx, backoff) {
-					break // ctx cancelled during backoff → stop retrying
+					return llm.Message{}, "", total, ctx.Err() // cancelled during backoff → stop
 				}
 				continue
 			}
@@ -347,7 +391,7 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 		}
 		if callErr == nil {
 			resetLLMFailStreak(taskID, selection.profileID)
-			return msg, sr, usage, nil
+			return msg, sr, total, nil
 		}
 		// Non-quota failures on a chain profile escalate after a consecutive
 		// streak (#99): same advance path as quota exhaust, truthful reason.
@@ -356,31 +400,31 @@ func completeTaskLLM(ctx context.Context, taskID string, req llm.CompletionReque
 				cause := fmt.Errorf("profile #%d failed %d consecutive calls (last: %w)", selection.profileID, llmFailStreakThreshold, callErr)
 				transition, markErr := hooks.exhaust(selection, cause)
 				if markErr != nil {
-					return llm.Message{}, "", llm.Usage{}, fmt.Errorf("mark profile exhausted after %v: %w", callErr, markErr)
+					return llm.Message{}, "", total, fmt.Errorf("mark profile exhausted after %v: %w", callErr, markErr)
 				}
 				if transition.Advanced && !transition.Stale && hooks.transition != nil {
 					hooks.transition(selection, transition, callErr)
 				}
 				if !transition.Stale && transition.NextProfileID == nil {
-					return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
+					return llm.Message{}, "", total, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
 				}
 				continue // replay the same logical request on the next profile
 			}
-			return llm.Message{}, "", llm.Usage{}, callErr
+			return llm.Message{}, "", total, callErr
 		}
 		// profileID=0: the explicit chain was cleared; non-quota error: pass through. Neither changes the task failover state.
 		if selection.profileID == 0 || !isQuotaExhaustedError(callErr) {
-			return llm.Message{}, "", llm.Usage{}, callErr
+			return llm.Message{}, "", total, callErr
 		}
 		transition, markErr := hooks.exhaust(selection, callErr)
 		if markErr != nil {
-			return llm.Message{}, "", llm.Usage{}, fmt.Errorf("mark profile quota exhausted after %v: %w", callErr, markErr)
+			return llm.Message{}, "", total, fmt.Errorf("mark profile quota exhausted after %v: %w", callErr, markErr)
 		}
 		if transition.Advanced && !transition.Stale && hooks.transition != nil {
 			hooks.transition(selection, transition, callErr)
 		}
 		if !transition.Stale && transition.NextProfileID == nil {
-			return llm.Message{}, "", llm.Usage{}, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
+			return llm.Message{}, "", total, &taskLLMError{taskID: taskID, chainExhausted: transition.ChainExhausted, cause: callErr}
 		}
 		// No output has been delivered to the caller, so replaying the same logical request on the next profile is safe.
 	}
@@ -397,6 +441,35 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			committed := false
 			var pending []llm.StreamEvent
 			var streamErr error
+			// The caller's llm.Accumulator sums usage across the whole logical call
+			// (every attempt and profile): message_start is added, message_delta is
+			// folded with MergeEcho. Folding one attempt's echo against the sum of
+			// earlier attempts would lose input/cache tokens, so each attempt's echoes
+			// are normalized here against that attempt alone and only the increment
+			// is passed on, as a message_start. The recorder below already billed the
+			// physical attempt; this only shapes what the caller adds up.
+			var attemptUsage llm.Usage
+			forward := func(event llm.StreamEvent) bool {
+				switch event.Type {
+				case llm.SEMessageStart:
+					attemptUsage.Add(event.Usage)
+				case llm.SEMessageDelta:
+					next := attemptUsage
+					next.MergeEcho(event.Usage)
+					inc := llm.Usage{
+						InputTokens:      next.InputTokens - attemptUsage.InputTokens,
+						OutputTokens:     next.OutputTokens - attemptUsage.OutputTokens,
+						CacheReadTokens:  next.CacheReadTokens - attemptUsage.CacheReadTokens,
+						CacheWriteTokens: next.CacheWriteTokens - attemptUsage.CacheWriteTokens,
+					}
+					attemptUsage = next
+					if inc != (llm.Usage{}) && !yield(llm.StreamEvent{Type: llm.SEMessageStart, Usage: inc}, nil) {
+						return false
+					}
+					event.Usage = llm.Usage{}
+				}
+				return yield(event, nil)
+			}
 			retries, backoffOf := sameProviderRetryPolicy(selection.retry)
 			// Same-provider safe-window retry: a transient failure before committed
 			// (nothing delivered to the caller yet) can be replayed verbatim without
@@ -405,6 +478,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 				committed = false
 				pending = nil
 				streamErr = nil
+				attemptUsage = llm.Usage{}
 				for event, err := range selection.provider.Stream(ctx, req) {
 					if err != nil {
 						streamErr = err
@@ -416,16 +490,28 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 					}
 					if !committed {
 						for _, buffered := range pending {
-							if !yield(buffered, nil) {
+							if !forward(buffered) {
 								return
 							}
 						}
 						pending = nil
 						committed = true
 					}
-					if !yield(event, nil) {
+					if !forward(event) {
 						return
 					}
+				}
+				if hooks.recordHealth != nil {
+					hooks.recordHealth(ctx, selection.healthProfileID, true, committed, streamErr)
+				}
+				if streamErr != nil && !committed {
+					// A failed uncommitted attempt delivers none of its events (they are
+					// never replayed), but the usage it reported survives as one
+					// message_start so the logical call still counts it.
+					if u := pendingUsage(pending); u != (llm.Usage{}) && !yield(llm.StreamEvent{Type: llm.SEMessageStart, Usage: u}, nil) {
+						return
+					}
+					pending = nil
 				}
 				if streamErr != nil && !committed && ctx.Err() == nil &&
 					attempt < retries && isRetryableStreamError(streamErr) {
@@ -433,7 +519,8 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 					log.Printf("[task-llm] task %s pre-commit stream failure, retrying on the same provider after %v (%d/%d): %v",
 						taskID, backoff, attempt+1, retries, streamErr)
 					if sleepCtx(ctx, backoff) {
-						break // ctx cancelled during backoff → stop retrying
+						yield(llm.StreamEvent{}, ctx.Err()) // cancelled during backoff → stop
+						return
 					}
 					continue
 				}
@@ -442,7 +529,7 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			if streamErr == nil {
 				resetLLMFailStreak(taskID, selection.profileID)
 				for _, buffered := range pending {
-					if !yield(buffered, nil) {
+					if !forward(buffered) {
 						return
 					}
 				}
@@ -474,11 +561,6 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 			// bundle was still in use. Agent/global fallback errors follow the legacy
 			// behavior and never mutate task failover state.
 			if selection.profileID == 0 || !isQuotaExhaustedError(streamErr) {
-				for _, buffered := range pending {
-					if !yield(buffered, nil) {
-						return
-					}
-				}
 				yield(llm.StreamEvent{}, streamErr)
 				return
 			}
@@ -508,9 +590,25 @@ func streamTaskLLM(ctx context.Context, taskID string, req llm.CompletionRequest
 	}
 }
 
+// pendingUsage is the usage the buffered (uncommitted) events of one attempt
+// reported. Only message_start can be buffered: message_delta commits.
+func pendingUsage(pending []llm.StreamEvent) llm.Usage {
+	var u llm.Usage
+	for _, ev := range pending {
+		if ev.Type == llm.SEMessageStart {
+			u.Add(ev.Usage)
+		}
+	}
+	return u
+}
+
+// streamEventCommitsOutput reports whether delivering event makes the attempt
+// unreplayable. Signed and redacted thinking and tool-use signatures are opaque
+// output the model bound to this exact response, so they commit like text.
 func streamEventCommitsOutput(event llm.StreamEvent) bool {
 	switch event.Type {
-	case llm.SETextDelta, llm.SEThinkingDelta, llm.SEToolInputJSON:
+	case llm.SETextDelta, llm.SEThinkingDelta, llm.SEToolInputJSON,
+		llm.SEThinkingSignature, llm.SERedactedThinking, llm.SEToolUseSignature:
 		return event.Text != ""
 	case llm.SEToolUseStart, llm.SEMessageDelta, llm.SEMessageStop:
 		return true
@@ -579,7 +677,7 @@ func isRetryableStreamError(err error) bool {
 // CompactionWindow mirrors current()'s precedence so the context window always
 // matches the provider the role will actually stream on.
 func (r *taskLLMRuntime) CompactionWindow() int {
-	if _, cfg, ok := r.s.agentBindingProvider(r.agentKey); ok {
+	if _, cfg, _, ok := r.s.agentBindingProvider(r.agentKey); ok {
 		return cfg.CompactionWindow()
 	}
 	taskNum, err := parseTaskID(r.taskID)
@@ -615,17 +713,19 @@ func (r *taskLLMRuntime) CompactionWindow() int {
 // (agents.llm_profile_id) — the highest-precedence level for task agents. ok=false
 // when the role has no binding or the bound profile no longer builds, so callers
 // fall through to the task chain. A bound profile stays exclusive unless
-// llm_pool_bind_fallback is on, which is what poolForBinding encodes.
-func (s *Server) agentBindingProvider(agentKey string) (llm.Provider, agent.Config, bool) {
+// llm_pool_bind_fallback is on, which is what poolForBinding encodes. The
+// returned id is the binding's profile, used to key breaker health when the
+// returned provider is not the Pool.
+func (s *Server) agentBindingProvider(agentKey string) (llm.Provider, agent.Config, int64, bool) {
 	id := s.effectiveProfileForAgent(agentKey, nil)
 	if id == nil {
-		return nil, agent.Config{}, false
+		return nil, agent.Config{}, 0, false
 	}
 	prov, cfg, ok := s.providerForProfile(*id)
 	if !ok {
-		return nil, agent.Config{}, false
+		return nil, agent.Config{}, 0, false
 	}
-	return s.poolForBinding(*id, prov, cfg), cfg, true
+	return s.poolForBinding(*id, prov, cfg), cfg, *id, true
 }
 
 // globalProvider returns the process-wide provider (persisted active profile or
@@ -638,6 +738,19 @@ func (s *Server) globalProvider() (llm.Provider, agent.Config, bool) {
 		return nil, agent.Config{}, false
 	}
 	return s.llmProv, s.llmCfg, true
+}
+
+// globalProviderWithProfile is globalProvider plus the llm_profiles row the
+// provider was built from (0 for an environment-only configuration). The id is
+// read under the same lock as the provider so the pair cannot be mixed across
+// an applyLLM rebuild.
+func (s *Server) globalProviderWithProfile() (llm.Provider, agent.Config, int64, bool) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if !s.llmOn || s.llmProv == nil {
+		return nil, agent.Config{}, 0, false
+	}
+	return s.llmProv, s.llmCfg, s.llmHealthProfileID, true
 }
 
 // taskRuntimeAvailable reports whether every listed role can resolve a provider
@@ -658,7 +771,7 @@ func (s *Server) taskRuntimeAvailable(t *Task, agentKeys ...string) bool {
 		_, _, unboundReady = s.globalProvider()
 	}
 	for _, key := range agentKeys {
-		if _, _, ok := s.agentBindingProvider(key); ok {
+		if _, _, _, ok := s.agentBindingProvider(key); ok {
 			continue
 		}
 		if !unboundReady {
@@ -694,6 +807,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // experimental: noa context compaction (platform-level switch, read every run)
 	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetFactTraffic(s.m.traffic) // fact provenance: relabel bytes captured from the target (#124 row 1)
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // operation-constraint injection into the worker (configurable, on by default)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
@@ -705,6 +819,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	pl.SetFactTraffic(s.m.traffic)
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // operation-constraint injection into the planner (configurable, on by default)
 	// cold-digest §7: background compaction of cold nodes. This per-task planner set
@@ -721,6 +836,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetMaxTokens(mainRuntime.maxTokens)
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // experimental: noa context compaction (platform-level switch, read every run)
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	main.SetFactTraffic(s.m.traffic)
 	main.SetWebSearch(s.webSearchFor("mainagent"))
 	main.SetSteerWork(s.engine.SteerWork) // steer_work: real-time course correction on running work by a human
 	bundle := &taskAgentBundle{
@@ -738,7 +854,7 @@ func (s *Server) syncTaskLLMState(pt *db.Task) {
 	id := fmt.Sprintf("%d", pt.ID)
 	s.m.mu.Lock()
 	if task := s.m.tasks[id]; task != nil {
-		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason, pt.LLMRotate)
 	}
 	s.m.mu.Unlock()
 }
